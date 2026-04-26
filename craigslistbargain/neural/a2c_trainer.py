@@ -566,7 +566,7 @@ class RLTrainer(BaseTrainer):
                 print('[Warning] update identity, but no identity exists.')
 
         price_w = getattr(args, "sa_lambda_price", 1.0)
-        switch_w = getattr(args, "sa_lambda_switch", 0.0)
+        switch_w = getattr(args, "sa_lambda_switch", 0.5)
 
         if update_table['tom']:
             l = loss['tom'][0] + price_w * loss['tom'][1] + switch_w * loss['tom'][2]

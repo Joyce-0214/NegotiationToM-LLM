@@ -110,6 +110,10 @@ if __name__ == '__main__':
                         help='cache file for LLM-generated utterance templates')
     parser.add_argument('--llm-nlg-fallback-to-template', action='store_true', default=False,
                         help='fallback to the old template NLG when the LLM backend fails')
+    parser.add_argument('--sa-lambda-price', type=float, default=1.0,
+                        help='weight for switch-aware ToM price supervision loss')
+    parser.add_argument('--sa-lambda-switch', type=float, default=0.5,
+                        help='weight for switch-aware ToM switch supervision loss')
 
     parser.add_argument('--fix-id', action='store_true', default=False, help='Fix identity')
     parser.add_argument('--strategy-in-words', action='store_true', default=False,
