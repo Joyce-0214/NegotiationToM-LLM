@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+cache/
+checkpoint/
+data/
+*.tar.gz
+*.bak
+*.debugbak
+.ipynb_checkpoints/
+.DS_Store

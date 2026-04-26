@@ -1,0 +1,12 @@
+run_name: eval_tom_beta1_paper34
+tom_beta: 1
+dialogues: 4352
+reward: -0.4232258747471621
+utility: 0.3127103966029186
+success_rate: 0.6121323529411765
+fairness: 0.29212377114054977
+length: 12.606847426470589
+time_line: Epoch 34/34, 4352 dialogues for 360.514s
+model_path: checkpoint/eval_tom_beta1_paper34
+log_path: logs/eval_tom_beta1_paper34
+cache_path: cache/eval_tom_beta1_paper34

@@ -1,0 +1,61 @@
+# NegotiationToM - Python 3.10 + PyTorch 2.x + CUDA 11.8
+# 适用于 RTX 4090 (Ada Lovelace, sm_89)
+#
+# 安装步骤:
+# 1. conda create -n nego_py310 python=3.10
+# 2. conda activate nego_py310
+# 3. pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# 4. pip install -r requirements_py310_cuda118.txt
+# 5. pip install -e .
+
+# ============ 核心依赖 ============
+numpy>=1.21.0,<2.0.0
+scipy>=1.9.0
+scikit-learn>=1.0.0
+pandas>=1.4.0
+
+# ============ NLP 相关 ============
+nltk>=3.7
+# torchtext>=0.15.0  # 注意: API 变化大，可能需要重写数据加载部分
+sentencepiece>=0.1.96
+
+# ============ 可视化 & 日志 ============
+matplotlib>=3.5.0
+seaborn>=0.12.0
+tensorboard>=2.10.0
+tqdm>=4.64.0
+
+# ============ Web 相关 ============
+flask>=2.0.0,<3.0.0
+flask-socketio>=5.0.0
+python-socketio>=5.0.0
+python-engineio>=4.0.0
+werkzeug>=2.0.0,<3.0.0
+jinja2>=3.0.0
+requests>=2.28.0
+
+# ============ 数据处理 ============
+ujson>=5.0.0
+langdetect>=1.0.9
+datasketch>=1.5.0
+whoosh>=2.7.4
+
+# ============ 工具 ============
+click>=8.0.0
+protobuf>=3.20.0,<4.0.0
+redis>=4.0.0
+ipython>=8.0.0
+
+# ============ 兼容性说明 ============
+#
+# 1. torchtext 变化很大:
+#    - 旧版 Field, BucketIterator 已废弃
+#    - 如果项目用了这些，需要重写或用 torchtext==0.6.0 (最后支持旧API的版本)
+#    - 但 0.6.0 不支持 PyTorch 2.x，所以可能需要手动实现数据加载
+#
+# 2. tensorboardX -> tensorboard:
+#    - 直接用 torch.utils.tensorboard 替代
+#    - 或者 tensorboard 包本身
+#
+# 3. 如果遇到 protobuf 版本冲突:
+#    - pip install protobuf==3.20.3
