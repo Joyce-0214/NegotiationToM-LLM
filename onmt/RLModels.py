@@ -490,13 +490,15 @@ class HistoryModel(nn.Module):
 
 
 class SwitchAwareHistoryModel(nn.Module):
-    def __init__(self, opt, state_dim, extra_dim, text_dim, n_intents):
+    def __init__(self, opt, state_dim, extra_dim, text_dim, n_intents, token_embeddings=None):
         super().__init__()
         self.opt = opt
         self.n_intents = n_intents
-        self.text_dim=text_dim
+        self.text_dim = text_dim
+        self.token_embeddings = token_embeddings
         self.hidden_vec = None
         self.hidden_stra = None
+        self._warned_missing_text_encoder = False
         # self.state_obs_dim = state_dim        # 应对应 batch.state.shape[-1]
         # self.extra_ctx_dim = extra_dim        # 应对应 batch.extra.shape[-1]
 
@@ -765,6 +767,33 @@ class SwitchAwareHistoryModel(nn.Module):
                 if uttr.size(0) != batch_size:
                     raise ValueError(f"uttr batch mismatch: expected {batch_size}, got {uttr.size(0)}")
                 return uttr.to(device=device, dtype=dtype).mean(dim=1)
+
+        if isinstance(uttr, (list, tuple)) and self.token_embeddings is not None:
+            pooled = []
+            for seq in uttr:
+                if not torch.is_tensor(seq):
+                    seq = torch.as_tensor(seq, dtype=torch.long, device=device)
+                else:
+                    seq = seq.to(device=device, dtype=torch.long)
+
+                seq = seq.reshape(-1)
+                if seq.numel() == 0:
+                    pooled.append(torch.zeros(text_dim, device=device, dtype=dtype))
+                    continue
+
+                token_emb = self.token_embeddings(seq)
+                pooled.append(token_emb.mean(dim=0).to(dtype=dtype))
+
+            if len(pooled) != batch_size:
+                raise ValueError(f"uttr batch mismatch: expected {batch_size}, got {len(pooled)}")
+            return torch.stack(pooled, dim=0)
+
+        if isinstance(uttr, (list, tuple)) and not self._warned_missing_text_encoder:
+            print(
+                "[SwitchAwareHistoryModel] warning: list[tensor] utterances received without "
+                "token_embeddings; text features fall back to zeros."
+            )
+            self._warned_missing_text_encoder = True
 
         # trainer 真实路径里 uttr 往往是 list[tensor]，先用零向量占位
         return torch.zeros(batch_size, text_dim, device=device, dtype=dtype)
