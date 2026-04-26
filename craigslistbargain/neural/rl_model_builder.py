@@ -213,6 +213,7 @@ def make_rl_model(model_opt, mappings, gpu, checkpoint=None, load_type='from_sl'
             extra_dim=extra_dim,
             text_dim=text_dim,
             n_intents=intent_size,
+            token_embeddings=src_embeddings if model_opt.use_utterance else None,
         )
         use_tom_checkpoint = False
 
