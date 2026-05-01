@@ -1,0 +1,72 @@
+EXP_NAME="switch_aware_tom"$1
+USE_GPU=$2
+SEED="0"
+LR="0.001"
+
+if [ $# -ge 3 ]; then
+  SEED=$3
+fi
+if [ $# -ge 4 ]; then
+  LR=$4
+fi
+
+LOAD_SAMPLE=""
+if [ $# -ge 5 ]; then
+  LOAD_SAMPLE="--load-sample cache/$5/data.pkl"
+fi
+
+echo "load sample from ${LOAD_SAMPLE:-<none, will sample online>}"
+MODEL_NAME="switch_aware"
+
+GPU_ARGS=""
+if [ -n "${USE_GPU}" ]; then
+  GPU_ARGS="--gpuid ${USE_GPU}"
+fi
+
+# =========================
+# Doubao / Volc Ark OpenAI-compatible NLG config
+# =========================
+LLM_NLG_MODEL="${LLM_NLG_MODEL:-doubao-seed-2-0-pro-260215}"
+LLM_NLG_API_BASE="${LLM_NLG_API_BASE:-https://ark.cn-beijing.volces.com/api/v3}"
+LLM_NLG_API_KEY_ENV="${LLM_NLG_API_KEY_ENV:-ARK_API_KEY}"
+LLM_NLG_TEMPERATURE="${LLM_NLG_TEMPERATURE:-0.2}"
+LLM_NLG_TIMEOUT="${LLM_NLG_TIMEOUT:-30}"
+LLM_NLG_MAX_RETRIES="${LLM_NLG_MAX_RETRIES:-2}"
+LLM_NLG_CACHE_PATH="${LLM_NLG_CACHE_PATH:-cache/llm_nlg_cache_doubao.json}"
+
+echo "[NLG] backend=llm"
+echo "[NLG] model=${LLM_NLG_MODEL}"
+echo "[NLG] api_base=${LLM_NLG_API_BASE}"
+echo "[NLG] api_key_env=${LLM_NLG_API_KEY_ENV}"
+echo "[NLG] cache=${LLM_NLG_CACHE_PATH}"
+
+mkdir -p checkpoint/${EXP_NAME}
+mkdir -p "$(dirname "${LLM_NLG_CACHE_PATH}")"
+
+PYTHONPATH=.. python -m craigslistbargain.multi_rl --schema-path data/craigslist-schema.json \
+--scenarios-path data/train-scenarios.json \
+--valid-scenarios-path data/dev-scenarios.json \
+--price-tracker data/price_tracker.pkl \
+--agent-checkpoints checkpoint/language/model_best.pt checkpoint/language/model_best.pt \
+--model-path checkpoint/${EXP_NAME} --mappings mappings/language \
+--optim adam --rnn-type RNN --rnn-size 300 --max-grad-norm -1 \
+--agents pt-neural pt-neural-r \
+--report-every 50 --max-turns 20 --num-dialogues 20 \
+--sample --temperature 0.5 --max-length 20 --reward margin \
+--dia-num 20 --state-length 4 --epochs 50 --use-utterance \
+--model lf2lf --model-type a2c --tom-test ${LOAD_SAMPLE} \
+--learning-rate ${LR} --name ${EXP_NAME} --seed ${SEED} \
+--tom-hidden-size 128 --tom-hidden-depth 2 --id-hidden-size 128 --id-hidden-depth 2 \
+--strategy-in-words --tom-model ${MODEL_NAME} \
+--sa-switch-infer-thresh 0.7 \
+--sa-switch-pos-weight 1.0 \
+--print-dialogues 3 --print-dev-detail --verbose ${GPU_ARGS} \
+--nlg-backend llm \
+--llm-nlg-model "${LLM_NLG_MODEL}" \
+--llm-nlg-api-base "${LLM_NLG_API_BASE}" \
+--llm-nlg-api-key-env "${LLM_NLG_API_KEY_ENV}" \
+--llm-nlg-temperature "${LLM_NLG_TEMPERATURE}" \
+--llm-nlg-timeout "${LLM_NLG_TIMEOUT}" \
+--llm-nlg-max-retries "${LLM_NLG_MAX_RETRIES}" \
+--llm-nlg-cache-path "${LLM_NLG_CACHE_PATH}" \
+--llm-nlg-fallback-to-template

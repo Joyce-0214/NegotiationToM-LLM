@@ -27,11 +27,21 @@ class Controller(BaseController):
             if agent != partner:
                 if tom_session is not None and not isinstance(tom_session, bool):
                     self._tom_hidden = tom_session.tom_hidden
-                    tom_session.receive(event)
+                    old_fake = getattr(tom_session, '_in_fake_step', False)
+                    tom_session._in_fake_step = True
+                    try:
+                        tom_session.receive(event)
+                    finally:
+                        tom_session._in_fake_step = old_fake
                     info_back = tom_session.send(is_fake=True, strategy=other_session.price_strategy_label)
                     return info_back
                 else:
-                    other_session.receive(event)
+                    old_fake = getattr(other_session, '_in_fake_step', False)
+                    other_session._in_fake_step = True
+                    try:
+                        other_session.receive(event)
+                    finally:
+                        other_session._in_fake_step = old_fake
                     info_back = other_session.send(is_fake=True)
                     return info_back
 

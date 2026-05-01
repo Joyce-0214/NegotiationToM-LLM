@@ -9,12 +9,20 @@ from cocoa.model.vocab import Vocabulary
 from cocoa.core.entity import is_entity, Entity, CanonicalEntity
 
 from craigslistbargain.core.event import Event
+from craigslistbargain.core.price_tracker import PriceScaler
 from craigslistbargain.sessions.session import Session
 from craigslistbargain.neural.preprocess import markers, Dialogue
 from craigslistbargain.neural.batcher_rl import RLBatch, ToMBatch, RawBatch
+from craigslistbargain.strategy.price_safety import BuyerPriceSafetyFilter, resolve_buyer_limit
+from craigslistbargain.strategy.buyer_response_policy import RuleBuyerResponsePolicy
+from craigslistbargain.strategy.rule_offer_planner import RuleBasedBuyerOfferPlanner
+from craigslistbargain.strategy_tracking.tactic_features import extract_turn_features
+from craigslistbargain.strategy_tracking.rule_tactic_tracker import RuleSellerTacticTracker
+from craigslistbargain.utils.turn_trace_logger import append_turn_trace
 import copy
 import time
 import json
+from uuid import uuid4
 
 
 class NeuralSession(Session):
@@ -44,6 +52,45 @@ class NeuralSession(Session):
         self.force_switch_persistent_value = None
         self.turn_idx = 0
         self.rollout_trace = []
+        self.strategy_ignore_surface_text = bool(
+            getattr(env, 'strategy_ignore_surface_text', False)
+        )
+        self.enforce_price_protocol = bool(
+            getattr(env, 'enforce_price_protocol', False)
+        )
+        self.enable_buyer_price_safety = bool(
+            getattr(env, 'enable_buyer_price_safety', False)
+        )
+        self.enable_seller_tactic_tracker = bool(
+            getattr(env, 'enable_seller_tactic_tracker', False)
+        )
+        self.enable_rule_offer_planner = bool(
+            getattr(env, 'enable_rule_offer_planner', False)
+        )
+        self.allow_buyer_price_decrease = bool(
+            getattr(env, 'allow_buyer_price_decrease', False)
+        )
+        self.turn_trace_path = getattr(env, 'turn_trace_path', None)
+        self.max_turns = getattr(env, 'max_turns', None)
+        self.seller_tactic_tracker = (
+            RuleSellerTacticTracker(debug=getattr(env, 'tactic_tracker_debug', False))
+            if self.enable_seller_tactic_tracker else None
+        )
+        self.buyer_price_safety_filter = (
+            BuyerPriceSafetyFilter(debug=getattr(env, 'price_safety_debug', False))
+            if self.enable_buyer_price_safety or self.enable_rule_offer_planner else None
+        )
+        self.buyer_response_policy = (
+            RuleBuyerResponsePolicy(debug=getattr(env, 'offer_planner_debug', False))
+            if self.enable_rule_offer_planner else None
+        )
+        self.rule_offer_planner = (
+            RuleBasedBuyerOfferPlanner(
+                safety_filter=self.buyer_price_safety_filter,
+                debug=getattr(env, 'offer_planner_debug', False),
+            )
+            if self.enable_rule_offer_planner else None
+        )
 
 
         # utterance generator
@@ -101,8 +148,398 @@ class NeuralSession(Session):
 
     def set_controller(self, controller):
         self.controller = controller
+        self._ensure_controller_trace_id(controller)
         if not isinstance(self.tom_session, bool):
             self.tom_session.controller = controller
+
+    def _ensure_controller_trace_id(self, controller):
+        if controller is None:
+            return None
+        trace_id = getattr(controller, 'trace_dialogue_id', None)
+        if trace_id is not None:
+            return trace_id
+
+        chat_id = getattr(controller, 'chat_id', None)
+        if chat_id is not None:
+            trace_id = chat_id
+        else:
+            scenario = getattr(controller, 'scenario', None)
+            scenario_id = getattr(scenario, 'uuid', None)
+            suffix = uuid4().hex[:8]
+            trace_id = "{}:{}".format(scenario_id, suffix) if scenario_id is not None else "dialogue:{}".format(suffix)
+        controller.trace_dialogue_id = trace_id
+        return trace_id
+
+    def _strategy_utterance(self, utterance):
+        """Optionally hide LLM surface text from policy state."""
+        if self.strategy_ignore_surface_text:
+            return []
+        return utterance
+
+    def _intent_name(self, lf):
+        intent = lf.get('intent')
+        if isinstance(intent, int):
+            return self.env.lf_vocab.to_word(intent)
+        return str(intent)
+
+    def _set_intent(self, lf, intent_name):
+        lf['intent'] = self.env.lf_vocab.to_ind(intent_name)
+
+    @staticmethod
+    def _as_float(value):
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _stored_price_to_real(self, price):
+        if price is None:
+            return None
+        if isinstance(price, (int, float)) and abs(float(price)) > 2.0:
+            return float(price)
+        entity = price
+        if isinstance(price, (int, float)):
+            entity = CanonicalEntity(type='price', value=float(price))
+        return self.builder.get_price_number(entity, self.kb)
+
+    def _real_price_to_scaled(self, price):
+        if price is None:
+            return None
+        scaled = PriceScaler.scale_price(self.kb, float(price))
+        return max(0.0, min(1.0, float(scaled)))
+
+    def _agent_role(self, agent):
+        own_role = self.kb.facts['personal']['Role']
+        if agent == self.agent:
+            return own_role
+        return 'seller' if own_role == 'buyer' else 'buyer'
+
+    def _price_history_by_role(self):
+        history = []
+        for agent, lf in zip(self.dialogue.agents, self.dialogue.lf_turns):
+            role = self._agent_role(agent)
+            price = self._stored_price_to_real(lf.get('price'))
+            intent = lf.get('intent')
+            if isinstance(intent, int):
+                intent = self.env.lf_vocab.to_word(intent)
+            history.append({
+                'role': role,
+                'agent': agent,
+                'price': price,
+                'intent': intent,
+            })
+        return history
+
+    def _last_price_for_role(self, role):
+        for item in reversed(self._price_history_by_role()):
+            if item.get('role') == role and item.get('price') is not None:
+                return item.get('price')
+        return None
+
+    def _dialogue_id(self):
+        controller = getattr(self, 'controller', None)
+        if controller is not None:
+            self._ensure_controller_trace_id(controller)
+            for val in (
+                getattr(controller, 'trace_dialogue_id', None),
+                getattr(controller, 'chat_id', None),
+                getattr(getattr(controller, 'scenario', None), 'uuid', None),
+            ):
+                if val is not None:
+                    return val
+        dialogue = getattr(self, 'dialogue', None)
+        if dialogue is not None and getattr(dialogue, 'uuid', None) is not None:
+            return dialogue.uuid
+        for obj in (self.kb, getattr(self.kb, 'scenario', None)):
+            val = getattr(obj, 'uuid', None)
+            if val is not None:
+                return val
+        return None
+
+    def _buyer_planner_context(self, raw_intent):
+        buyer_limit, _ = resolve_buyer_limit({'kb': self.kb})
+        return {
+            'role': self.kb.facts['personal']['Role'],
+            'raw_intent': raw_intent,
+            'last_buyer_price': self._last_price_for_role('buyer'),
+            'last_seller_price': self._last_price_for_role('seller'),
+            'buyer_limit': buyer_limit,
+            'round_id': self.turn_idx,
+            'max_round': self.max_turns,
+            'allow_price_decrease': self.allow_buyer_price_decrease,
+            'kb': self.kb,
+        }
+
+    def _apply_buyer_intent_safety(self, lf, output_data, context):
+        if context is None or context.get('role') != 'buyer':
+            return lf
+
+        intent = self._intent_name(lf)
+        unsafe_accept_intents = (markers.ACCEPT, 'agree', 'agree-noprice')
+        if intent not in unsafe_accept_intents:
+            return lf
+
+        seller_ask = self._as_float(context.get('last_seller_price'))
+        buyer_limit = self._as_float(context.get('buyer_limit'))
+        if seller_ask is None or buyer_limit is None or seller_ask <= buyer_limit:
+            return lf
+
+        planned_price = self._as_float(output_data.get('planned_price'))
+        if planned_price is None:
+            planned_price = buyer_limit
+
+        from_intent = intent
+        self._set_intent(lf, 'counter')
+        lf['price'] = planned_price
+        output_data['planned_price'] = planned_price
+        output_data['intent_safety_changed'] = True
+        output_data['intent_safety_reason'] = (
+            "blocked_{}_because_seller_ask_{}_exceeds_buyer_limit_{}".format(
+                from_intent, seller_ask, buyer_limit)
+        )
+        output_data['intent_safety_from_intent'] = from_intent
+        output_data['intent_safety_to_intent'] = 'counter'
+        return lf
+
+    def _sync_planned_price_to_lf(self, lf, output_data):
+        if self.kb.facts['personal']['Role'] != 'buyer':
+            return lf
+
+        planned_price = self._as_float(output_data.get('planned_price'))
+        if planned_price is None:
+            return lf
+
+        intent = self._intent_name(lf)
+        if intent in (markers.ACCEPT, markers.REJECT, markers.QUIT):
+            return lf
+
+        current_price = self._as_float(lf.get('price'))
+        if current_price is None or abs(current_price - planned_price) > 1e-6:
+            output_data.setdefault('protocol_overrides', []).append({
+                'type': 'planned_price_sync_to_lf',
+                'from': lf.get('price'),
+                'to': planned_price,
+            })
+            output_data['lf_price_sync_changed'] = True
+        lf['price'] = planned_price
+        return lf
+
+    def _current_tactic_state(self):
+        if self.seller_tactic_tracker is not None:
+            return self.seller_tactic_tracker.get_state()
+        return {
+            'tactic_dist': {},
+            'tactic_label': None,
+            'switch_prob': None,
+            'features': {},
+        }
+
+    def _update_seller_tactic_from_event(self, event, lf, utterance):
+        if self.seller_tactic_tracker is None:
+            return None
+        role = self._agent_role(event.agent)
+        if role != 'seller':
+            return None
+        current_event = {
+            'price': self._stored_price_to_real(lf.get('price')),
+            'intent': lf.get('intent'),
+            'utterance': getattr(event, 'data', None),
+        }
+        features = extract_turn_features(
+            self._price_history_by_role(),
+            current_event,
+            role='seller',
+            market_price=self.kb.facts.get('item', {}).get('Price'),
+            round_id=self.turn_idx,
+            max_round=self.max_turns,
+        )
+        tactic_state = self.seller_tactic_tracker.update(features)
+        self._append_seller_turn_trace(tactic_state, current_event)
+        return tactic_state
+
+    def _append_seller_turn_trace(self, tactic_state, current_event):
+        if not self.turn_trace_path:
+            return
+        features = tactic_state.get('features', {}) if tactic_state else {}
+        append_turn_trace(self.turn_trace_path, {
+            'dialogue_id': self._dialogue_id(),
+            'turn_id': self.turn_idx,
+            'role': 'seller',
+            'price_unit': 'real',
+            'seller_price': current_event.get('price'),
+            'seller_tactic_label': tactic_state.get('tactic_label') if tactic_state else None,
+            'seller_tactic_dist': tactic_state.get('tactic_dist') if tactic_state else None,
+            'seller_switch_prob': tactic_state.get('switch_prob') if tactic_state else None,
+            'seller_concession': features.get('seller_concession'),
+            'price_gap_to_buyer': features.get('price_gap_to_buyer'),
+            'utterance': current_event.get('utterance'),
+        })
+
+    def _append_buyer_turn_trace(self, output_data, lf, utterance, context):
+        if not self.turn_trace_path:
+            return
+        append_turn_trace(self.turn_trace_path, {
+            'dialogue_id': self._dialogue_id(),
+            'turn_id': self.turn_idx,
+            'role': 'buyer',
+            'raw_intent': output_data.get('raw_intent'),
+            'final_intent_used_by_lf': output_data.get('final_intent_used_by_lf'),
+            'price_unit': 'real',
+            'raw_price_before_safety': output_data.get('raw_price_before_safety'),
+            'safe_price': output_data.get('safe_price'),
+            'planned_price': output_data.get('planned_price'),
+            'final_price_used_by_lf': lf.get('price'),
+            'last_buyer_price': context.get('last_buyer_price'),
+            'last_seller_price': context.get('last_seller_price'),
+            'buyer_limit': context.get('buyer_limit'),
+            'price_safety_changed': output_data.get('price_safety_changed'),
+            'price_safety_violations': output_data.get('price_safety_violations'),
+            'seller_tactic_label': output_data.get('seller_tactic_label'),
+            'seller_tactic_dist': output_data.get('seller_tactic_dist'),
+            'seller_switch_prob': output_data.get('seller_switch_prob'),
+            'buyer_strategy': output_data.get('buyer_strategy'),
+            'planner_reason': output_data.get('planner_reason'),
+            'intent_safety_changed': output_data.get('intent_safety_changed'),
+            'intent_safety_reason': output_data.get('intent_safety_reason'),
+            'lf_price_sync_changed': output_data.get('lf_price_sync_changed'),
+            'utterance': utterance,
+        })
+
+    def _apply_buyer_price_modules(self, tokens, output_data):
+        if self.kb.facts['personal']['Role'] != 'buyer':
+            return tokens, None
+        if not (self.enable_buyer_price_safety or self.enable_rule_offer_planner):
+            return tokens, None
+        if tokens is None:
+            return tokens, None
+
+        raw_intent = self._intent_ind2word(tokens[0]) if isinstance(tokens[0], int) else str(tokens[0])
+        raw_price = self._to_real_price(tokens[1]) if len(tokens) > 1 and tokens[1] is not None else None
+        context = self._buyer_planner_context(raw_intent)
+        tactic_state = self._current_tactic_state()
+
+        output_data['raw_intent'] = raw_intent
+        output_data['raw_price_before_safety'] = raw_price
+        output_data['seller_tactic_label'] = tactic_state.get('tactic_label')
+        output_data['seller_tactic_dist'] = tactic_state.get('tactic_dist')
+        output_data['seller_switch_prob'] = tactic_state.get('switch_prob')
+        output_data['intent_safety_changed'] = False
+        output_data['intent_safety_reason'] = None
+        output_data['lf_price_sync_changed'] = False
+
+        if self.buyer_price_safety_filter is not None:
+            safety = self.buyer_price_safety_filter.check_and_fix(raw_price, context)
+        else:
+            safety = {
+                'safe_price': raw_price,
+                'changed': False,
+                'violations': [],
+                'reason': 'price safety disabled',
+            }
+        safe_price = safety.get('safe_price')
+        planned_price = safe_price
+        buyer_strategy = None
+        planner_reason = safety.get('reason')
+
+        if self.rule_offer_planner is not None:
+            strategy_info = self.buyer_response_policy.select(tactic_state, context)
+            plan = self.rule_offer_planner.plan(
+                raw_price, safe_price, context, strategy_info, tactic_state)
+            planned_price = plan.get('planned_price')
+            buyer_strategy = plan.get('buyer_strategy')
+            planner_reason = plan.get('reason')
+
+        output_data['safe_price'] = safe_price
+        output_data['planned_price'] = planned_price
+        output_data['price_safety_changed'] = safety.get('changed')
+        output_data['price_safety_violations'] = safety.get('violations')
+        output_data['buyer_strategy'] = buyer_strategy
+        output_data['planner_reason'] = planner_reason
+
+        if planned_price is not None and len(tokens) > 1:
+            tokens = list(tokens)
+            tokens[1] = self._real_price_to_scaled(planned_price)
+            output_data['price'] = tokens[1]
+        return tokens, context
+
+    def _last_real_prices_by_agent(self):
+        last_prices = [None, None]
+        for agent, lf in zip(self.dialogue.agents, self.dialogue.lf_turns):
+            if lf.get('price') is None:
+                continue
+            last_prices[agent] = self._stored_price_to_real(lf.get('price'))
+        return last_prices
+
+    def _apply_price_protocol(self, lf, output_data):
+        if not self.enforce_price_protocol:
+            return lf
+
+        intent = self._intent_name(lf)
+        price = lf.get('price')
+        last_prices = self._last_real_prices_by_agent()
+        own_last = last_prices[self.agent]
+        partner_last = last_prices[self.agent ^ 1]
+        role = self.kb.role
+        overrides = []
+
+        # A formal offer should commit to the speaker's latest bargaining price,
+        # instead of sampling a fresh price after the counter trajectory.
+        if intent == markers.OFFER and own_last is not None:
+            if price != own_last:
+                overrides.append({
+                    'type': 'offer_reuse_last_price',
+                    'from': price,
+                    'to': own_last,
+                })
+            price = own_last
+
+        # Keep concession trajectories monotonic: sellers do not raise asks,
+        # buyers do not lower bids.
+        if price is not None and own_last is not None:
+            if role == 'seller' and price > own_last:
+                overrides.append({
+                    'type': 'seller_monotonic_ask',
+                    'from': price,
+                    'to': own_last,
+                })
+                price = own_last
+            elif role == 'buyer' and price < own_last:
+                overrides.append({
+                    'type': 'buyer_monotonic_bid',
+                    'from': price,
+                    'to': own_last,
+                })
+                price = own_last
+
+        seller_ask = own_last if role == 'seller' else partner_last
+        buyer_bid = own_last if role == 'buyer' else partner_last
+        if price is not None:
+            if role == 'seller':
+                seller_ask = price
+            else:
+                buyer_bid = price
+
+        # If the bid already reaches the ask, make the next act a formal offer at
+        # the seller's ask. This prevents another sampled offer from drifting.
+        if seller_ask is not None and buyer_bid is not None and buyer_bid >= seller_ask:
+            if intent != markers.OFFER or price != seller_ask:
+                overrides.append({
+                    'type': 'crossing_to_offer',
+                    'from_intent': intent,
+                    'from_price': price,
+                    'to_intent': markers.OFFER,
+                    'to_price': seller_ask,
+                })
+            self._set_intent(lf, markers.OFFER)
+            intent = markers.OFFER
+            price = seller_ask
+
+        lf['price'] = price
+        if overrides:
+            output_data.setdefault('protocol_overrides', []).extend(overrides)
+        return lf
 
     # TODO: move this to preprocess?
     def convert_to_int(self):
@@ -132,9 +569,15 @@ class NeuralSession(Session):
         if lf.get('intent') is None:
             print('lf i is None: ', lf)
         if another_dia is None:
-            self.dialogue.add_utterance(event.agent, utterance, lf=lf)
+            if not getattr(self, '_in_fake_step', False):
+                self._update_seller_tactic_from_event(event, lf, utterance)
+            self.dialogue.add_utterance(event.agent, self._strategy_utterance(utterance), lf=lf)
         else:
-            another_dia.add_utterance(self.dialogue.agent ^ 1, utterance, lf=lf)
+            another_dia.add_utterance(
+                self.dialogue.agent ^ 1,
+                self._strategy_utterance(utterance),
+                lf=lf,
+            )
 
 
     def _has_entity(self, tokens):
@@ -362,6 +805,7 @@ class NeuralSession(Session):
                 if "belief_type_probs" in sa else None,
             "belief_confidence": float(sa["belief_confidence"].reshape(-1)[0])
                 if "belief_confidence" in sa else None,
+            "protocol_overrides": output_data.get("protocol_overrides"),
         }
 
         # 新增：price top-k 诊断
@@ -493,7 +937,12 @@ class NeuralSession(Session):
             tmp_u = self.env.preprocessor.process_event(e, self.kb)
             # tmp_u = self._add_strategy_in_uttr(tmp_u)
 
-            self.dialogue.add_utterance(self.agent, tmp_u, lf=tmp_lf, price_act=p_act)
+            self.dialogue.add_utterance(
+                self.agent,
+                self._strategy_utterance(tmp_u),
+                lf=tmp_lf,
+                price_act=p_act,
+            )
 
             # From [0,1] to real price
 
@@ -655,8 +1104,18 @@ class NeuralSession(Session):
         if tokens is None:
             return None
 
+        planner_context = None
+        tokens, planner_context = self._apply_buyer_price_modules(tokens, output_data)
+
         lf = self._raw_token_to_lf(tokens)
+        lf = self._apply_price_protocol(lf, output_data)
+        lf = self._apply_buyer_intent_safety(lf, output_data, planner_context)
+        lf = self._sync_planned_price_to_lf(lf, output_data)
+        output_data['final_intent_used_by_lf'] = self._intent_name(lf)
         utterance, uid = self._lf_to_utterance(lf)
+        if planner_context is not None:
+            output_data['final_price_used_by_lf'] = lf.get('price')
+            self._append_buyer_turn_trace(output_data, lf, utterance, planner_context)
         lf['price_act'] = output_data.get('price_act')
         lf['prob'] = output_data.get('prob')
 
@@ -666,7 +1125,12 @@ class NeuralSession(Session):
             print('event', event.action, event.metadata)
 
         price_act = {'price_act': output_data.get('price_act'), 'prob': output_data.get('prob')}
-        self.dialogue.add_utterance(self.agent, uttr, lf=lf, price_act=price_act)
+        self.dialogue.add_utterance(
+            self.agent,
+            self._strategy_utterance(uttr),
+            lf=lf,
+            price_act=price_act,
+        )
 
         # 在 turn_idx 自增之前打印，这样第一轮是 0
         self.print_turn_trace(output_data, lf, turn_idx=self.turn_idx)

@@ -139,6 +139,22 @@ def add_system_arguments(parser):
     cocoa.options.add_rulebased_arguments(parser)
     add_price_tracker_arguments(parser)
     add_neural_system_arguments(parser)
+    parser.add_argument('--enable-buyer-price-safety', action='store_true', default=False,
+                        help='enable buyer-side post-policy price safety filtering')
+    parser.add_argument('--enable-seller-tactic-tracker', action='store_true', default=False,
+                        help='enable rule-based seller turn-level tactic tracking')
+    parser.add_argument('--enable-rule-offer-planner', action='store_true', default=False,
+                        help='enable rule-based buyer offer planner after price safety')
+    parser.add_argument('--allow-buyer-price-decrease', action='store_true', default=False,
+                        help='allow buyer planned prices to decrease below the previous buyer offer')
+    parser.add_argument('--price-safety-debug', action='store_true', default=False,
+                        help='print buyer price safety diagnostics')
+    parser.add_argument('--tactic-tracker-debug', action='store_true', default=False,
+                        help='print seller tactic tracker diagnostics')
+    parser.add_argument('--offer-planner-debug', action='store_true', default=False,
+                        help='print buyer offer planner diagnostics')
+    parser.add_argument('--turn-trace-path', default=None,
+                        help='optional CSV path for buyer/seller turn trace logs')
     # NOTE: hybrid system arguments are covered by neural system and rulebased system
 
 def add_hybrid_system_arguments(parser):

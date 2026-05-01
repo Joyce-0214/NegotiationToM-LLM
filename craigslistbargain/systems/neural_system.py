@@ -142,7 +142,12 @@ class PytorchNeuralSystem(System):
             'stop_symbol', 'remove_symbols', 'gt_prefix', 'lfint_map',
             'max_len', 'dialogue_batcher', 'cuda', 'lf_vocab',
             'dialogue_generator', 'utterance_builder', 'model_args', 'critic', 'usetom', 
-            'name', 'price_strategy', 'tom_type', 'nlg_module', 'tom_generator', 'tom_model', 'id', 'model_type'])
+            'name', 'price_strategy', 'tom_type', 'nlg_module', 'tom_generator', 'tom_model',
+            'id', 'model_type', 'strategy_ignore_surface_text', 'enforce_price_protocol',
+            'enable_buyer_price_safety', 'enable_seller_tactic_tracker',
+            'enable_rule_offer_planner', 'allow_buyer_price_decrease',
+            'price_safety_debug', 'tactic_tracker_debug', 'offer_planner_debug',
+            'turn_trace_path', 'max_turns'])
         self.env = Env(actor, vocab, preprocessor, textint_map,
             stop_symbol=vocab.to_ind(markers.EOS), remove_symbols=remove_symbols,
             gt_prefix=1, lfint_map=lfint_map,
@@ -150,7 +155,18 @@ class PytorchNeuralSystem(System):
             dialogue_generator=generator, utterance_builder=builder, model_args=model_args,
             critic=critic, usetom=(name == 'tom'), name=name,
             price_strategy=args.price_strategy, tom_type=args.tom_type, nlg_module=nlg_module,
-            tom_generator=tom_generator, tom_model=tom, id=id, model_type=model_type)
+            tom_generator=tom_generator, tom_model=tom, id=id, model_type=model_type,
+            strategy_ignore_surface_text=getattr(args, 'strategy_ignore_surface_text', False),
+            enforce_price_protocol=getattr(args, 'enforce_price_protocol', False),
+            enable_buyer_price_safety=getattr(args, 'enable_buyer_price_safety', False),
+            enable_seller_tactic_tracker=getattr(args, 'enable_seller_tactic_tracker', False),
+            enable_rule_offer_planner=getattr(args, 'enable_rule_offer_planner', False),
+            allow_buyer_price_decrease=getattr(args, 'allow_buyer_price_decrease', False),
+            price_safety_debug=getattr(args, 'price_safety_debug', False),
+            tactic_tracker_debug=getattr(args, 'tactic_tracker_debug', False),
+            offer_planner_debug=getattr(args, 'offer_planner_debug', False),
+            turn_trace_path=getattr(args, 'turn_trace_path', None),
+            max_turns=getattr(args, 'max_turns', None))
         # print('usetom?:', (name == 'tom'))
 
     @classmethod

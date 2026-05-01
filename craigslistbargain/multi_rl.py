@@ -114,6 +114,26 @@ if __name__ == '__main__':
                         help='weight for switch-aware ToM price supervision loss')
     parser.add_argument('--sa-lambda-switch', type=float, default=0.5,
                         help='weight for switch-aware ToM switch supervision loss')
+    parser.add_argument('--strategy-ignore-surface-text', action='store_true', default=False,
+                        help='keep generated surface text out of strategy state; only structured LF/price are encoded')
+    parser.add_argument('--enforce-price-protocol', action='store_true', default=False,
+                        help='enforce monotonic offers and close immediately when buyer bid crosses seller ask')
+    parser.add_argument('--enable-buyer-price-safety', action='store_true', default=False,
+                        help='enable buyer-side post-policy price safety filtering')
+    parser.add_argument('--enable-seller-tactic-tracker', action='store_true', default=False,
+                        help='enable rule-based seller turn-level tactic tracking')
+    parser.add_argument('--enable-rule-offer-planner', action='store_true', default=False,
+                        help='enable rule-based buyer offer planner after price safety')
+    parser.add_argument('--allow-buyer-price-decrease', action='store_true', default=False,
+                        help='allow buyer planned prices to decrease below the previous buyer offer')
+    parser.add_argument('--price-safety-debug', action='store_true', default=False,
+                        help='print buyer price safety diagnostics')
+    parser.add_argument('--tactic-tracker-debug', action='store_true', default=False,
+                        help='print seller tactic tracker diagnostics')
+    parser.add_argument('--offer-planner-debug', action='store_true', default=False,
+                        help='print buyer offer planner diagnostics')
+    parser.add_argument('--turn-trace-path', default=None,
+                        help='optional CSV path for buyer/seller turn trace logs')
 
     parser.add_argument('--fix-id', action='store_true', default=False, help='Fix identity')
     parser.add_argument('--strategy-in-words', action='store_true', default=False,
