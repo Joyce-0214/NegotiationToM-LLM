@@ -52,6 +52,7 @@ class NeuralSession(Session):
         self.force_switch_persistent_value = None
         self.turn_idx = 0
         self.rollout_trace = []
+        self.real_price_history = []
         self.strategy_ignore_surface_text = bool(
             getattr(env, 'strategy_ignore_surface_text', False)
         )
@@ -197,8 +198,6 @@ class NeuralSession(Session):
     def _stored_price_to_real(self, price):
         if price is None:
             return None
-        if isinstance(price, (int, float)) and abs(float(price)) > 2.0:
-            return float(price)
         entity = price
         if isinstance(price, (int, float)):
             entity = CanonicalEntity(type='price', value=float(price))
@@ -210,6 +209,90 @@ class NeuralSession(Session):
         scaled = PriceScaler.scale_price(self.kb, float(price))
         return max(0.0, min(1.0, float(scaled)))
 
+    def _price_from_lf(self, lf):
+        if not isinstance(lf, dict):
+            return None, None
+
+        for key in ('real_price', 'final_price_used_by_lf'):
+            price = self._as_float(lf.get(key))
+            if price is not None:
+                return price, key
+
+        output_data = lf.get('output_data')
+        if isinstance(output_data, dict):
+            for key in ('real_price', 'final_price_used_by_lf'):
+                price = self._as_float(output_data.get(key))
+                if price is not None:
+                    return price, 'output_data.{}'.format(key)
+
+        if lf.get('price_unit') == 'real':
+            price = self._as_float(lf.get('price'))
+            if price is not None:
+                return price, 'price_unit:real'
+
+        return None, None
+
+    def _stamp_real_price_fields(self, lf, output_data=None):
+        if not isinstance(lf, dict):
+            return None
+        price = self._as_float(lf.get('final_price_used_by_lf'))
+        if price is None:
+            price = self._as_float(lf.get('real_price'))
+        if price is None:
+            price = self._as_float(lf.get('price'))
+        if price is None:
+            return None
+
+        lf['real_price'] = price
+        lf['final_price_used_by_lf'] = price
+        lf['price_unit'] = 'real'
+        if output_data is not None:
+            output_data['real_price'] = price
+            output_data['final_price_used_by_lf'] = price
+        return price
+
+    def _append_real_price_history(self, agent, lf, utterance=None, source=None):
+        if not isinstance(lf, dict):
+            return None
+
+        price, price_source = self._price_from_lf(lf)
+        has_price_candidate = any(
+            lf.get(key) is not None
+            for key in ('price', 'real_price', 'final_price_used_by_lf')
+        )
+        if not has_price_candidate:
+            output_data = lf.get('output_data')
+            has_price_candidate = isinstance(output_data, dict) and any(
+                output_data.get(key) is not None
+                for key in ('price', 'real_price', 'final_price_used_by_lf')
+            )
+
+        intent = lf.get('intent')
+        if isinstance(intent, int):
+            intent = self.env.lf_vocab.to_word(intent)
+
+        entry = {
+            'role': self._agent_role(agent),
+            'agent': agent,
+            'price': price,
+            'price_source': price_source,
+            'real_price_source_missing': bool(has_price_candidate and price is None),
+            'intent': intent,
+            'utterance': self._utterance_text(utterance),
+            'source': source,
+        }
+        self.real_price_history.append(entry)
+        return entry
+
+    def _last_history_entry_for_role(self, role, require_price=False):
+        for item in reversed(self.real_price_history):
+            if item.get('role') != role:
+                continue
+            if require_price and item.get('price') is None:
+                continue
+            return item
+        return None
+
     def _agent_role(self, agent):
         own_role = self.kb.facts['personal']['Role']
         if agent == self.agent:
@@ -217,26 +300,11 @@ class NeuralSession(Session):
         return 'seller' if own_role == 'buyer' else 'buyer'
 
     def _price_history_by_role(self):
-        history = []
-        for agent, lf in zip(self.dialogue.agents, self.dialogue.lf_turns):
-            role = self._agent_role(agent)
-            price = self._stored_price_to_real(lf.get('price'))
-            intent = lf.get('intent')
-            if isinstance(intent, int):
-                intent = self.env.lf_vocab.to_word(intent)
-            history.append({
-                'role': role,
-                'agent': agent,
-                'price': price,
-                'intent': intent,
-            })
-        return history
+        return [dict(item) for item in self.real_price_history]
 
     def _last_price_for_role(self, role):
-        for item in reversed(self._price_history_by_role()):
-            if item.get('role') == role and item.get('price') is not None:
-                return item.get('price')
-        return None
+        item = self._last_history_entry_for_role(role, require_price=True)
+        return item.get('price') if item else None
 
     def _dialogue_id(self):
         controller = getattr(self, 'controller', None)
@@ -260,11 +328,24 @@ class NeuralSession(Session):
 
     def _buyer_planner_context(self, raw_intent):
         buyer_limit, _ = resolve_buyer_limit({'kb': self.kb})
+        last_buyer_entry = self._last_history_entry_for_role('buyer', require_price=True)
+        last_seller_entry = self._last_history_entry_for_role('seller', require_price=True)
+        latest_buyer_entry = self._last_history_entry_for_role('buyer', require_price=False)
+        latest_seller_entry = self._last_history_entry_for_role('seller', require_price=False)
+        missing_roles = []
+        if latest_buyer_entry and latest_buyer_entry.get('real_price_source_missing'):
+            missing_roles.append('buyer')
+        if latest_seller_entry and latest_seller_entry.get('real_price_source_missing'):
+            missing_roles.append('seller')
         return {
             'role': self.kb.facts['personal']['Role'],
             'raw_intent': raw_intent,
-            'last_buyer_price': self._last_price_for_role('buyer'),
-            'last_seller_price': self._last_price_for_role('seller'),
+            'last_buyer_price': last_buyer_entry.get('price') if last_buyer_entry else None,
+            'last_seller_price': last_seller_entry.get('price') if last_seller_entry else None,
+            'last_buyer_price_source': last_buyer_entry.get('price_source') if last_buyer_entry else None,
+            'last_seller_price_source': last_seller_entry.get('price_source') if last_seller_entry else None,
+            'real_price_source_missing': bool(missing_roles),
+            'real_price_source_missing_roles': missing_roles,
             'buyer_limit': buyer_limit,
             'round_id': self.turn_idx,
             'max_round': self.max_turns,
@@ -342,10 +423,13 @@ class NeuralSession(Session):
         role = self._agent_role(event.agent)
         if role != 'seller':
             return None
+        price, price_source = self._price_from_lf(lf)
+        surface_utterance = lf.get('surface_utterance') or getattr(event, 'data', None)
         current_event = {
-            'price': self._stored_price_to_real(lf.get('price')),
+            'price': price,
+            'price_source': price_source,
             'intent': lf.get('intent'),
-            'utterance': getattr(event, 'data', None),
+            'utterance': surface_utterance,
         }
         features = extract_turn_features(
             self._price_history_by_role(),
@@ -369,6 +453,8 @@ class NeuralSession(Session):
             'role': 'seller',
             'price_unit': 'real',
             'seller_price': current_event.get('price'),
+            'final_price_used_by_lf': current_event.get('price'),
+            'real_price_source': current_event.get('price_source'),
             'seller_tactic_label': tactic_state.get('tactic_label') if tactic_state else None,
             'seller_tactic_dist': tactic_state.get('tactic_dist') if tactic_state else None,
             'seller_switch_prob': tactic_state.get('switch_prob') if tactic_state else None,
@@ -380,6 +466,7 @@ class NeuralSession(Session):
     def _append_buyer_turn_trace(self, output_data, lf, utterance, context):
         if not self.turn_trace_path:
             return
+        final_price, final_price_source = self._price_from_lf(lf)
         append_turn_trace(self.turn_trace_path, {
             'dialogue_id': self._dialogue_id(),
             'turn_id': self.turn_idx,
@@ -390,9 +477,14 @@ class NeuralSession(Session):
             'raw_price_before_safety': output_data.get('raw_price_before_safety'),
             'safe_price': output_data.get('safe_price'),
             'planned_price': output_data.get('planned_price'),
-            'final_price_used_by_lf': lf.get('price'),
+            'final_price_used_by_lf': final_price if final_price is not None else lf.get('price'),
+            'real_price_source': final_price_source,
             'last_buyer_price': context.get('last_buyer_price'),
             'last_seller_price': context.get('last_seller_price'),
+            'last_buyer_price_source': context.get('last_buyer_price_source'),
+            'last_seller_price_source': context.get('last_seller_price_source'),
+            'real_price_source_missing': context.get('real_price_source_missing'),
+            'real_price_source_missing_roles': context.get('real_price_source_missing_roles'),
             'buyer_limit': context.get('buyer_limit'),
             'price_safety_changed': output_data.get('price_safety_changed'),
             'price_safety_violations': output_data.get('price_safety_violations'),
@@ -404,6 +496,11 @@ class NeuralSession(Session):
             'intent_safety_changed': output_data.get('intent_safety_changed'),
             'intent_safety_reason': output_data.get('intent_safety_reason'),
             'lf_price_sync_changed': output_data.get('lf_price_sync_changed'),
+            'nlg_fallback_used': output_data.get('nlg_fallback_used'),
+            'nlg_fallback_reason': output_data.get('nlg_fallback_reason'),
+            'empty_utterance_repaired': output_data.get('empty_utterance_repaired'),
+            'act_text_mismatch': output_data.get('act_text_mismatch'),
+            'act_text_mismatch_reason': output_data.get('act_text_mismatch_reason'),
             'utterance': utterance,
         })
 
@@ -451,6 +548,12 @@ class NeuralSession(Session):
             buyer_strategy = plan.get('buyer_strategy')
             planner_reason = plan.get('reason')
 
+        if context.get('real_price_source_missing'):
+            missing_reason = "missing real historical price source: {}".format(
+                ",".join(context.get('real_price_source_missing_roles') or [])
+            )
+            planner_reason = "{}; {}".format(planner_reason, missing_reason) if planner_reason else missing_reason
+
         output_data['safe_price'] = safe_price
         output_data['planned_price'] = planned_price
         output_data['price_safety_changed'] = safety.get('changed')
@@ -466,10 +569,12 @@ class NeuralSession(Session):
 
     def _last_real_prices_by_agent(self):
         last_prices = [None, None]
-        for agent, lf in zip(self.dialogue.agents, self.dialogue.lf_turns):
-            if lf.get('price') is None:
+        for item in self.real_price_history:
+            price = item.get('price')
+            agent = item.get('agent')
+            if price is None or agent is None:
                 continue
-            last_prices[agent] = self._stored_price_to_real(lf.get('price'))
+            last_prices[agent] = price
         return last_prices
 
     def _apply_price_protocol(self, lf, output_data):
@@ -571,6 +676,7 @@ class NeuralSession(Session):
         if another_dia is None:
             if not getattr(self, '_in_fake_step', False):
                 self._update_seller_tactic_from_event(event, lf, utterance)
+                self._append_real_price_history(event.agent, lf, utterance, source='receive')
             self.dialogue.add_utterance(event.agent, self._strategy_utterance(utterance), lf=lf)
         else:
             another_dia.add_utterance(
@@ -609,8 +715,10 @@ class NeuralSession(Session):
     def _to_event(self, utterance, lf, output_data):
         intent = lf.get('intent')
         intent = self.env.lf_vocab.to_word(intent)
-        metadata = {**lf, 'output_data': output_data}
-        metadata_nolf = {'output_data': output_data}
+        metadata = dict(lf)
+        self._stamp_real_price_fields(metadata)
+        metadata['output_data'] = output_data
+        metadata['surface_utterance'] = self._utterance_text(utterance)
         if intent == markers.OFFER:
             return self.offer('offer', metadata)
         elif intent == markers.ACCEPT:
@@ -691,6 +799,113 @@ class NeuralSession(Session):
         return utterance, uid
 
     @staticmethod
+    def _utterance_text(utterance):
+        if utterance is None:
+            return ''
+        if isinstance(utterance, (list, tuple)):
+            return ' '.join(str(x) for x in utterance)
+        return str(utterance)
+
+    def _is_empty_utterance(self, utterance):
+        return len(self._utterance_text(utterance).strip()) == 0
+
+    def _format_price_for_text(self, price):
+        price = self._as_float(price)
+        if price is None:
+            return None
+        if abs(price - round(price)) <= 1e-6:
+            return "${}".format(int(round(price)))
+        text = "{:.2f}".format(price).rstrip('0').rstrip('.')
+        return "${}".format(text)
+
+    def _fallback_utterance_for_lf(self, lf, output_data=None):
+        intent = self._intent_name(lf)
+        price_text = self._format_price_for_text(lf.get('price'))
+        intent_safety_changed = bool((output_data or {}).get('intent_safety_changed'))
+
+        if intent == 'counter':
+            if price_text:
+                if intent_safety_changed:
+                    return "I can't go above {0}, but I can offer {0}.".format(price_text)
+                return "I can offer {}.".format(price_text)
+            return "I can make a different offer."
+        if intent == markers.OFFER or intent == 'offer':
+            if price_text:
+                return "My offer is {}.".format(price_text)
+            return "I would like to make an offer."
+        if intent == markers.REJECT or intent == 'reject':
+            return "Sorry, that price does not work for me."
+        if intent == markers.ACCEPT or intent == 'accept':
+            return "That works for me."
+        if intent == markers.QUIT or intent == 'quit':
+            return "I don't think we can reach a deal."
+        if price_text:
+            return "I can offer {}.".format(price_text)
+        return "Okay."
+
+    def _act_text_mismatch(self, lf, utterance):
+        intent = self._intent_name(lf)
+        text = self._utterance_text(utterance).lower()
+        if not text.strip():
+            return False, None
+
+        accept_like_phrases = (
+            'deal',
+            "i'll take it",
+            'ill take it',
+            'i will take it',
+            'take it for',
+            'sounds good',
+            'i agree',
+            'accepted',
+            'that works',
+            'i accept',
+        )
+        if intent == 'counter':
+            for phrase in accept_like_phrases:
+                if phrase in text:
+                    return True, 'counter utterance contains accept-like phrase: {}'.format(phrase)
+        return False, None
+
+    def _realize_utterance(self, lf, output_data):
+        output_data['nlg_fallback_used'] = False
+        output_data['nlg_fallback_reason'] = None
+        output_data['empty_utterance_repaired'] = False
+        output_data['act_text_mismatch'] = False
+        output_data['act_text_mismatch_reason'] = None
+
+        uid = None
+        force_fallback = bool(output_data.get('intent_safety_changed'))
+        if force_fallback:
+            utterance = self._fallback_utterance_for_lf(lf, output_data)
+            output_data['nlg_fallback_used'] = True
+            output_data['nlg_fallback_reason'] = 'intent_safety_changed'
+        else:
+            try:
+                utterance, uid = self._lf_to_utterance(lf)
+            except Exception as exc:
+                utterance = None
+                output_data['nlg_fallback_used'] = True
+                output_data['nlg_fallback_reason'] = 'nlg_exception: {}'.format(exc)
+
+        if self._is_empty_utterance(utterance):
+            utterance = self._fallback_utterance_for_lf(lf, output_data)
+            output_data['nlg_fallback_used'] = True
+            output_data['nlg_fallback_reason'] = output_data.get('nlg_fallback_reason') or 'empty_utterance'
+            output_data['empty_utterance_repaired'] = True
+
+        mismatch, reason = self._act_text_mismatch(lf, utterance)
+        if mismatch and not output_data.get('nlg_fallback_used'):
+            utterance = self._fallback_utterance_for_lf(lf, output_data)
+            output_data['nlg_fallback_used'] = True
+            output_data['nlg_fallback_reason'] = 'act_text_mismatch: {}'.format(reason)
+            mismatch, reason = self._act_text_mismatch(lf, utterance)
+
+        output_data['act_text_mismatch'] = bool(mismatch)
+        output_data['act_text_mismatch_reason'] = reason
+        return utterance, uid
+
+    @staticmethod
     def _pact_to_price(p_act, p_last):
         pmax, pmin = p_last[0], p_last[1]
         p = 1
@@ -748,6 +963,7 @@ class NeuralSession(Session):
         self.sa_hidden = None
         self.turn_idx = 0
         self.rollout_trace = []
+        self.real_price_history = []
 
         if clear_schedule:
             self.force_switch_schedule = {}
@@ -1112,7 +1328,8 @@ class NeuralSession(Session):
         lf = self._apply_buyer_intent_safety(lf, output_data, planner_context)
         lf = self._sync_planned_price_to_lf(lf, output_data)
         output_data['final_intent_used_by_lf'] = self._intent_name(lf)
-        utterance, uid = self._lf_to_utterance(lf)
+        self._stamp_real_price_fields(lf, output_data)
+        utterance, uid = self._realize_utterance(lf, output_data)
         if planner_context is not None:
             output_data['final_price_used_by_lf'] = lf.get('price')
             self._append_buyer_turn_trace(output_data, lf, utterance, planner_context)
@@ -1124,6 +1341,7 @@ class NeuralSession(Session):
         if uttr is None:
             print('event', event.action, event.metadata)
 
+        self._append_real_price_history(self.agent, event.metadata, utterance, source='send')
         price_act = {'price_act': output_data.get('price_act'), 'prob': output_data.get('prob')}
         self.dialogue.add_utterance(
             self.agent,

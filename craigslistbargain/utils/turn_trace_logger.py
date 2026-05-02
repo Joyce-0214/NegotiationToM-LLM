@@ -23,11 +23,16 @@ def append_turn_trace(path, row):
         "final_intent_used_by_lf", "price_unit",
         "raw_price_before_safety", "safe_price", "planned_price",
         "final_price_used_by_lf", "last_buyer_price", "last_seller_price",
+        "last_buyer_price_source", "last_seller_price_source",
+        "real_price_source", "real_price_source_missing",
+        "real_price_source_missing_roles",
         "buyer_limit", "price_safety_changed", "price_safety_violations",
         "seller_price", "seller_tactic_label", "seller_tactic_dist",
         "seller_switch_prob", "seller_concession", "price_gap_to_buyer",
         "buyer_strategy", "planner_reason", "intent_safety_changed",
-        "intent_safety_reason", "lf_price_sync_changed", "utterance",
+        "intent_safety_reason", "lf_price_sync_changed",
+        "nlg_fallback_used", "nlg_fallback_reason", "empty_utterance_repaired",
+        "act_text_mismatch", "act_text_mismatch_reason", "utterance",
     ]
     for key in row.keys():
         if key not in fieldnames:

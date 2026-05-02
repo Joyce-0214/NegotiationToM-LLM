@@ -92,10 +92,15 @@ class BuyerPriceSafetyFilter(object):
         last_seller_price = _as_float(context.get("last_seller_price"))
         last_buyer_price = _as_float(context.get("last_buyer_price"))
         allow_price_decrease = bool(context.get("allow_price_decrease", False))
+        seller_lowered_below_buyer = (
+            last_seller_price is not None
+            and last_buyer_price is not None
+            and last_seller_price < last_buyer_price
+        )
 
         lower_bound = None
         upper_bound = None
-        if last_buyer_price is not None and not allow_price_decrease:
+        if last_buyer_price is not None and not allow_price_decrease and not seller_lowered_below_buyer:
             lower_bound = last_buyer_price
         if buyer_limit is not None:
             upper_bound = buyer_limit
